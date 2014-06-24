@@ -29,6 +29,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Threading;
 using System.Windows.Forms;
+using System.Collections.Generic;
 
 namespace ScreenCaptureLib
 {
@@ -69,6 +70,10 @@ namespace ScreenCaptureLib
                         }
                     }
 
+                    Bitmap transparentImage;
+                    // List of (whiteBG, blackBG) capture pairs.
+                    List<Tuple<Bitmap, Bitmap>> capList = new List<Tuple<Bitmap, Bitmap>>();
+
                     using (Form form = new Form())
                     {
                         form.BackColor = Color.White;
@@ -103,21 +108,38 @@ namespace ScreenCaptureLib
 
                         whiteBackground2 = (Bitmap)CaptureRectangleNative(rect);
 
+                        capList.Add(new Tuple<Bitmap, Bitmap>(whiteBackground, blackBackground));
+
+
+                        if (ImageHelpers.IsImagesEqual(whiteBackground, whiteBackground2))
+                        {
+                            transparentImage = CreateTransparentImage(whiteBackground, blackBackground);
+                            isTransparent = true;
+                        }
+                        else
+                        {
+                            DebugHelper.WriteLine("Transparent capture failed. Reason: Images not equal.");
+                            transparentImage = whiteBackground2;
+
+                            // Capture an extra black to complete a second pair.
+                            form.BackColor = Color.Black;
+                            Application.DoEvents();
+
+                            blackBackground = (Bitmap)CaptureRectangleNative(rect);
+                            capList.Add(new Tuple<Bitmap, Bitmap>(whiteBackground2, blackBackground));
+
+                            // Not sure if this could error out.
+                            transparentImage = CreateTransparentImageFromList(capList);
+                            isTransparent = true;
+
+                            DebugHelper.WriteLine("Transparency triaged.");
+                        }
+
                         form.Close();
                     }
 
-                    Bitmap transparentImage;
 
-                    if (ImageHelpers.IsImagesEqual(whiteBackground, whiteBackground2))
-                    {
-                        transparentImage = CreateTransparentImage(whiteBackground, blackBackground);
-                        isTransparent = true;
-                    }
-                    else
-                    {
-                        DebugHelper.WriteLine("Transparent capture failed. Reason: Images not equal.");
-                        transparentImage = whiteBackground2;
-                    }
+
 
                     if (cursor != null && cursor.IsVisible)
                     {
@@ -200,6 +222,80 @@ namespace ScreenCaptureLib
             }
 
             return whiteBackground;
+        }
+
+        private static Bitmap CreateTransparentImageFromList(List<Tuple<Bitmap, Bitmap>> mapList)
+        {
+            Bitmap result = new Bitmap(mapList[0].Item1.Width, mapList[0].Item1.Height, PixelFormat.Format32bppArgb);
+
+            // Lock the images for analysis.
+            List<Tuple<UnsafeBitmap, UnsafeBitmap>> unsafeBmapTupleList = new List<Tuple<UnsafeBitmap, UnsafeBitmap>>();
+            foreach (Tuple<Bitmap, Bitmap> mapTuple in mapList)
+            {
+                UnsafeBitmap whiteBitmap = new UnsafeBitmap(mapTuple.Item1, true, ImageLockMode.ReadOnly);
+                UnsafeBitmap blackBitmap = new UnsafeBitmap(mapTuple.Item2, true, ImageLockMode.ReadOnly);
+                unsafeBmapTupleList.Add(new Tuple<UnsafeBitmap, UnsafeBitmap>(whiteBitmap, blackBitmap));
+            }
+
+            // Assume resolution from first bmap
+            int pixelCount = unsafeBmapTupleList[0].Item1.PixelCount;
+            bool[] pixelIsSafe = new bool[pixelCount];
+
+            for (int i = 0; i < pixelCount; i++)
+            {
+                ColorBgra firstWhite = unsafeBmapTupleList[0].Item1.GetPixel(i);
+                ColorBgra secondWhite = unsafeBmapTupleList[1].Item1.GetPixel(i);
+                ColorBgra firstBlack = unsafeBmapTupleList[0].Item2.GetPixel(i);
+                ColorBgra secondBlack = unsafeBmapTupleList[1].Item2.GetPixel(i);
+
+                if (firstWhite != secondWhite || firstBlack != secondBlack)
+                {
+                    pixelIsSafe[i] = false;
+                }
+                else
+                {
+                    pixelIsSafe[i] = true;
+                }
+
+                if (pixelIsSafe[i] && ((firstWhite == firstBlack) || (secondWhite == secondBlack)))
+                {
+                    pixelIsSafe[i] = false;
+                }
+            }
+
+            using (UnsafeBitmap resultBitmap = new UnsafeBitmap(result, true, ImageLockMode.WriteOnly))
+            {
+                for (int i = 0; i < pixelCount; i++)
+                {
+                    ColorBgra white = unsafeBmapTupleList[0].Item1.GetPixel(i);
+                    ColorBgra black = unsafeBmapTupleList[0].Item2.GetPixel(i);
+
+                    if (pixelIsSafe[i])
+                    {
+                        double alpha = ( ( ((black.Red - white.Red) + (black.Green - white.Green) + (black.Blue - white.Blue)) / 3) + 255) / 255.0;
+
+                        if (alpha == 1)
+                        {
+                            resultBitmap.SetPixel(i, white);
+                        }
+                        else if (alpha > 0)
+                        {
+                            white.Blue = (byte)(black.Blue / alpha);
+                            white.Green = (byte)(black.Green / alpha);
+                            white.Red = (byte)(black.Red / alpha);
+                            white.Alpha = (byte)(255 * alpha);
+
+                            resultBitmap.SetPixel(i, white);
+                        }
+                    }
+                    else
+                    {
+                        resultBitmap.SetPixel(i, white);
+                    }
+                }
+            }
+
+            return result;
         }
 
         private static Bitmap TrimTransparent(Bitmap bitmap)
